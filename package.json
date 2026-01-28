@@ -1,0 +1,37 @@
+{
+  "name": "wopr-plugin-provider-opencode",
+  "version": "1.0.0",
+  "description": "OpenCode AI provider plugin for WOPR",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "wopr",
+    "wopr-plugin",
+    "provider",
+    "opencode",
+    "ai-coding"
+  ],
+  "author": "",
+  "license": "MIT",
+  "peerDependencies": {
+    "wopr": "^0.0.1"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "typescript": "^5.0.0"
+  },
+  "wopr": {
+    "plugin": {
+      "name": "provider-opencode",
+      "category": "provider",
+      "description": "OpenCode AI SDK for coding tasks"
+    }
+  }
+}
