@@ -1,12 +1,113 @@
 /**
  * WOPR Plugin: OpenCode Provider
- * 
+ *
  * Provides OpenCode AI access via the OpenCode SDK.
+ * Supports A2A tools via MCP server configuration.
  * Install: wopr plugin install wopr-plugin-provider-opencode
  */
 
-import type { ModelProvider, ModelClient, ModelQueryOptions } from "wopr/dist/types/provider.js";
-import type { WOPRPlugin, WOPRPluginContext } from "wopr/dist/types.js";
+import winston from "winston";
+
+// Type definitions (peer dependency from wopr)
+interface A2AToolResult {
+  content: Array<{
+    type: "text" | "image" | "resource";
+    text?: string;
+    data?: string;
+    mimeType?: string;
+  }>;
+  isError?: boolean;
+}
+
+interface A2AToolDefinition {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  handler: (args: Record<string, unknown>) => Promise<A2AToolResult>;
+}
+
+interface A2AServerConfig {
+  name: string;
+  version?: string;
+  tools: A2AToolDefinition[];
+}
+
+interface ModelQueryOptions {
+  prompt: string;
+  systemPrompt?: string;
+  resume?: string;
+  model?: string;
+  temperature?: number;
+  maxTokens?: number;
+  topP?: number;
+  images?: string[];
+  tools?: string[];
+  a2aServers?: Record<string, A2AServerConfig>;
+  allowedTools?: string[];
+  providerOptions?: Record<string, unknown>;
+}
+
+interface ModelClient {
+  query(options: ModelQueryOptions): AsyncGenerator<unknown>;
+  listModels(): Promise<string[]>;
+  healthCheck(): Promise<boolean>;
+}
+
+interface ModelProvider {
+  id: string;
+  name: string;
+  description: string;
+  defaultModel: string;
+  supportedModels: string[];
+  validateCredentials(credentials: string): Promise<boolean>;
+  createClient(credential: string, options?: Record<string, unknown>): Promise<ModelClient>;
+  getCredentialType(): "api-key" | "oauth" | "custom";
+}
+
+interface ConfigField {
+  name: string;
+  type: string;
+  label: string;
+  placeholder?: string;
+  required?: boolean;
+  description?: string;
+  options?: Array<{ value: string; label: string }>;
+  default?: unknown;
+}
+
+interface ConfigSchema {
+  title: string;
+  description: string;
+  fields: ConfigField[];
+}
+
+interface WOPRPluginContext {
+  log: { info: (msg: string) => void };
+  registerProvider: (provider: ModelProvider) => void;
+  registerConfigSchema: (name: string, schema: ConfigSchema) => void;
+}
+
+interface WOPRPlugin {
+  name: string;
+  version: string;
+  description: string;
+  init(ctx: WOPRPluginContext): Promise<void>;
+  shutdown(): Promise<void>;
+}
+
+// Setup winston logger
+const logger = winston.createLogger({
+  level: "info",
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.errors({ stack: true }),
+    winston.format.json()
+  ),
+  defaultMeta: { service: "wopr-plugin-provider-opencode" },
+  transports: [
+    new winston.transports.Console({ level: "warn" })
+  ],
+});
 
 let OpencodeSDK: any;
 
@@ -33,7 +134,7 @@ async function loadOpencodeSDK() {
 const opencodeProvider: ModelProvider = {
   id: "opencode",
   name: "OpenCode",
-  description: "OpenCode AI SDK for coding tasks (image URLs passed in prompt)",
+  description: "OpenCode AI SDK with A2A/MCP support",
   defaultModel: "claude-3-5-sonnet",
   supportedModels: [
     "claude-3-5-sonnet",
@@ -51,6 +152,7 @@ const opencodeProvider: ModelProvider = {
       const health = await client.global.health();
       return health.data?.healthy === true;
     } catch (error) {
+      logger.error("[opencode] Credential validation failed:", error);
       return true; // Allow anyway, server might not be running yet
     }
   },
@@ -68,7 +170,7 @@ const opencodeProvider: ModelProvider = {
 };
 
 /**
- * OpenCode client implementation
+ * OpenCode client implementation with A2A support
  */
 class OpencodeClient implements ModelClient {
   private client: any;
@@ -90,22 +192,26 @@ class OpencodeClient implements ModelClient {
     return this.client;
   }
 
-  async *query(opts: ModelQueryOptions): AsyncGenerator<any> {
+  async *query(opts: ModelQueryOptions): AsyncGenerator<unknown> {
     const client = await this.getClient();
 
     try {
       if (!this.sessionId) {
         const session = await client.session.create({
-          body: { 
+          body: {
             title: `WOPR Session ${Date.now()}`,
           },
         });
         this.sessionId = session.data?.id;
+        logger.info(`[opencode] Session created: ${this.sessionId}`);
       }
 
       if (!this.sessionId) {
         throw new Error("Failed to create OpenCode session");
       }
+
+      // Yield session ID for resumption support
+      yield { type: "system", subtype: "init", session_id: this.sessionId };
 
       let promptText = opts.prompt;
       if (opts.images && opts.images.length > 0) {
@@ -115,20 +221,44 @@ class OpencodeClient implements ModelClient {
 
       const parts: any[] = [{ type: "text", text: promptText }];
 
+      // Build prompt options
+      const promptOptions: any = {
+        model: opts.model
+          ? { providerID: "anthropic", modelID: opts.model }
+          : { providerID: "anthropic", modelID: opencodeProvider.defaultModel },
+        parts,
+      };
+
+      // A2A tools - pass as custom tools if supported
+      if (opts.a2aServers && Object.keys(opts.a2aServers).length > 0) {
+        const allTools: string[] = [];
+        for (const [serverName, config] of Object.entries(opts.a2aServers)) {
+          for (const tool of config.tools) {
+            allTools.push(`mcp__${serverName}__${tool.name}`);
+          }
+        }
+        promptOptions.enabledTools = allTools;
+        logger.info(`[opencode] A2A tools configured: ${allTools.join(", ")}`);
+      }
+
+      // Allowed tools
+      if (opts.allowedTools && opts.allowedTools.length > 0) {
+        promptOptions.enabledTools = [
+          ...(promptOptions.enabledTools || []),
+          ...opts.allowedTools
+        ];
+        logger.info(`[opencode] Allowed tools: ${opts.allowedTools.join(", ")}`);
+      }
+
       const result = await client.session.prompt({
         path: { id: this.sessionId },
-        body: {
-          model: opts.model 
-            ? { providerID: "anthropic", modelID: opts.model }
-            : { providerID: "anthropic", modelID: opencodeProvider.defaultModel },
-          parts,
-        },
+        body: promptOptions,
       });
 
       if (result.data) {
-        const parts = result.data.parts || [];
-        
-        for (const part of parts) {
+        const resultParts = result.data.parts || [];
+
+        for (const part of resultParts) {
           if (part.type === "text") {
             yield {
               type: "assistant",
@@ -153,6 +283,7 @@ class OpencodeClient implements ModelClient {
         };
       }
     } catch (error) {
+      logger.error("[opencode] Query failed:", error);
       throw new Error(
         `OpenCode query failed: ${error instanceof Error ? error.message : String(error)}`
       );
@@ -168,7 +299,8 @@ class OpencodeClient implements ModelClient {
       const client = await this.getClient();
       const health = await client.global.health();
       return health.data?.healthy === true;
-    } catch {
+    } catch (error) {
+      logger.error("[opencode] Health check failed:", error);
       return false;
     }
   }
@@ -179,13 +311,13 @@ class OpencodeClient implements ModelClient {
  */
 const plugin: WOPRPlugin = {
   name: "provider-opencode",
-  version: "1.0.0",
-  description: "OpenCode AI provider for WOPR",
+  version: "1.1.0", // Bumped for A2A support
+  description: "OpenCode AI provider for WOPR with A2A/MCP support",
 
   async init(ctx: WOPRPluginContext) {
     ctx.log.info("Registering OpenCode provider...");
     ctx.registerProvider(opencodeProvider);
-    ctx.log.info("OpenCode provider registered");
+    ctx.log.info("OpenCode provider registered (supports A2A/MCP)");
 
     // Register config schema for UI
     ctx.registerConfigSchema("provider-opencode", {
@@ -220,7 +352,7 @@ const plugin: WOPRPlugin = {
   },
 
   async shutdown() {
-    console.log("[provider-opencode] Shutting down");
+    logger.info("[provider-opencode] Shutting down");
   },
 };
 

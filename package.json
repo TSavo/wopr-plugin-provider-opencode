@@ -1,6 +1,6 @@
 {
   "name": "wopr-plugin-provider-opencode",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "OpenCode AI provider plugin for WOPR",
   "main": "index.js",
   "type": "module",
@@ -21,7 +21,8 @@
     "wopr": "^0.0.1"
   },
   "dependencies": {
-    "@opencode-ai/sdk": "^0.1.0"
+    "@opencode-ai/sdk": "^0.1.0",
+    "winston": "^3.11.0"
   },
   "devDependencies": {
     "@types/node": "^18.0.0",
